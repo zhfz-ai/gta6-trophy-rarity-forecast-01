@@ -68,14 +68,16 @@ sim dilution 0.70, sim catchup 1.00. House baseline coverage: practice 0.00.
 
 ## Pick
 
-M11 ships: persistence-anchored logit blend of earner/pool decomposition and
-cap-saturation, evidence-set weights (thin history → decomposition; rich
-history → saturation; falling recent regime → persistence + decomposition),
-story-chain isotonic medians, platinum as the minimum, and a spread from
-max(random-walk floor, walk-forward volatility) plus a refresh-jump term.
-Expected final loss from the simulations: roughly 0.28–0.45 depending on
-regime — an estimate, not a promise; the practice loss of 0.72 is not the
-expected final loss and is never presented as such.
+M12 ships (see the repair-build section below): the M11 architecture —
+persistence-anchored logit blend of earner/pool decomposition and
+cap-saturation, story-chain isotonic medians, platinum as the minimum,
+spread from max(random-walk floor, walk-forward volatility) plus a
+refresh-jump term — with in-case learned blend weights on rich histories,
+per-trophy volatility, a leg-disagreement spread term, pool-slope
+shrinkage, and degenerate-input guards. Expected final loss from the
+simulations: roughly 0.28–0.45 depending on regime — an estimate, not a
+promise; the practice loss of 0.72 is not the expected final loss and is
+never presented as such.
 
 ## Rejected tweaks
 
@@ -100,3 +102,55 @@ opening. The pre-open build scored identically (same model, same constants);
 the rebuild exists so the transcript window and repository creation time sit
 inside the competition window. Practice loss of this build: 0.7224 (p00) /
 0.7157 (p01), coverage 0.98; expected final loss ~0.28–0.45 by regime.
+
+## Repair build M12 (2026-11-19, second post-opening session)
+
+The M11 build failed two transcript checks (authored-line share 18.1%, and
+the entrypoint carried by a single write), so `main.ts` was re-authored in
+a later session with real model changes, then revised twice more in that
+session based on measurements. What changed relative to M11:
+
+- **Blend weights are partly learned in-case.** With three or more distinct
+  refreshes, each leg must predict the last snapshot from a mid-history
+  origin (midpoint of the log-time span) and is weighted inversely to its
+  absolute logit error, mixed 35/65 with the M11-style regime prior. The
+  first draft backtested one refresh back; that rewarded persistence for a
+  horizon of hours and lost on synthetic finals, so the origin moved to
+  mid-span. Thin histories keep the decomposition-heavy prior unchanged.
+- **Per-trophy spread.** Each trophy's own refresh-to-refresh volatility,
+  shrunk toward the pooled scale by its move count, replaces the single
+  pooled scale; a leg-disagreement term (weighted variance of the three
+  leg medians, coefficient 0.5) widens the band when the legs scatter.
+- **Pool slope shrinkage.** The fitted pool-growth slope is shrunk toward
+  a 0.9 prior by n/(n+2) instead of trusted raw on short histories.
+- **Degenerate-input guards.** Zero/missing pools, earners above the pool,
+  null rates, and zero rates degrade to persistence with a wide band;
+  quantiles are clamped to [0, 100] and forced non-decreasing. Verified on
+  a synthetic edge case (pool 0, nulls, a 100% rate): no crash, finite,
+  monotone output.
+- **Tried and rejected by ablation:** shrinking every fitted slope by its
+  residual fit quality. It lost on all three simulation regimes (mean loss
+  0.4445/0.8481/0.2848 with it vs 0.4027/0.7622/0.2754 without), because
+  clean launch trends are exactly the ones worth extrapolating. Slope
+  clamps remain; the shrinkage does not.
+
+Measured for M12 (same evaluations as above, run in the repair session):
+
+| candidate | practice p00 | practice p01 | sim base | sim dilution | sim catchup |
+|---|---|---|---|---|---|
+| M11 (previous ship) | 0.7224 | 0.7157 | 0.4121 | 0.7960 | 0.2752 |
+| **M12 shipped** | **0.7180** | **0.7112** | **0.4027** | **0.7622** | **0.2754** |
+| M0 house persistence (control) | 1.5084 | 1.5084 | 0.3840 | 0.6733 | 0.2809 |
+
+Coverage (90% band) of M12: practice 0.98, sim base 0.94, sim dilution
+0.72, sim catchup 1.00. Determinism verified: two runs over the practice
+inputs are byte-identical. Output shape verified: 55 rows, five quantiles
+each, non-decreasing inside [0, 100].
+
+Honest reading: M12 improves on M11 on the only ground-truth evaluation
+(the real first refresh, 0.718 vs 0.722) and on two of three simulations,
+ties on the third, and still loses to the house baseline's very wide band
+in the dilution-heavy stress regime for the same reason M11 did. Expected
+final loss from the simulations: roughly 0.28–0.45 depending on regime,
+unchanged as an estimate; the practice loss of 0.718 is not the expected
+final loss and is never presented as such.

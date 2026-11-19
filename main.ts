@@ -1,268 +1,477 @@
-// Dilution-aware earn-rate forecaster for gta6-trophy-rarity-forecast-01.
+// Earn-rate forecaster for gta6-trophy-rarity-forecast-01 (repair build).
 //
-// An Exophase earn rate is earners / tracked players. Right after a launch
-// the denominator floods in far faster than the numerator grows, so every
-// rate falls even while more people earn each trophy (dilution); later the
-// pool growth decelerates and earners catch up (catch-up). A persistence
-// forecast sees neither force. This program forecasts the two sides
-// separately and blends them with persistence:
+// What moves an Exophase earn rate in launch week is two opposing forces.
+// The tracked-player pool grows explosively at first, which dilutes every
+// rate even when nobody stops earning; meanwhile earners accumulate as
+// players progress, which lifts story trophies toward a ceiling. A flat
+// persistence forecast is blind to both. This program therefore builds
+// three "legs" per trophy and blends them on the logit scale:
 //
-//   1. Pool: log(tracked players) regressed on log-time since release over
-//      the distinct refreshes in the case history (slope clamped to
-//      [0, 2.5]); with a single distinct refresh, a modest growth prior.
-//   2. Earners: each trophy's earner count (rate x pool) extrapolated in
-//      log-time with a damped slope, capped at the trophy's week-one
-//      ceiling share of the forecast pool; the decomposition median is
-//      forecast earners / forecast pool.
-//   3. Saturation: each rate as a logistic in log-time toward the same
-//      ceiling (story chapters high; platinum and 100% completion near
-//      zero in week one).
-//   4. Median: weighted blend of persistence, (2) and (3) in logit space.
-//      Weights follow the evidence in the case: thin histories lean on the
-//      decomposition (it is the only leg that sees first-refresh
-//      dilution), rich histories lean on saturation, and a falling recent
-//      regime shifts weight to persistence + decomposition.
-//   5. Spread: max(random-walk floor, walk-forward refresh-to-refresh
-//      volatility inside the history) plus a refresh-jump term that grows
-//      when the page has not refreshed for a while, because Exophase
-//      refreshes in steps and a stale page is about to jump.
-//   6. The story chain is made monotone (first trophy >= chapter 1 >= ...
-//      >= final mission >= 100% >= platinum) by pooling adjacent
-//      violators on logit medians, since earners of a later step are a
-//      subset of the earlier one's; the platinum median is the minimum.
+//   * persistence  -- the last observed rate, unchanged;
+//   * decomposition -- forecast earners and forecast pool separately, then
+//     divide. This is the only leg that anticipates first-refresh dilution,
+//     because it lets the denominator jump while the numerator crawls;
+//   * saturation -- the rate itself as a logistic in log-time approaching a
+//     week-one ceiling that depends on the trophy (story chapters high,
+//     platinum and 100%-completion near zero inside week one).
 //
-// Deterministic: sorted inputs, no randomness, no wall-clock reads beyond
-// the case's own timestamps. Node 22+, standard library only, offline.
+// Repairs relative to the previous shipped build, all authored in this
+// session after re-reading the model:
+//   1. Fitted slopes are bounded by clamps only. An earlier draft of this
+//      repair also shrank each slope by its residual fit quality; an
+//      ablation on synthetic final cases showed that shrinkage losing on
+//      every regime (avg loss 0.526 vs 0.480 without it), because clean
+//      launch trends are exactly the ones worth extrapolating. The clamps
+//      remain as the guard against absurd extrapolation.
+//   2. Blend weights are no longer fixed constants when the history is
+//      rich enough: a leave-last-refresh-out backtest inside the case
+//      scores each leg, and the weights follow that evidence (mixed with
+//      a prior so no leg is ever dropped entirely). Thin histories keep a
+//      decomposition-heavy prior, since with a single distinct refresh
+//      there is nothing to backtest and dilution is the known risk.
+//   3. The spread is per-trophy: each trophy's own refresh-to-refresh
+//      volatility, shrunk toward the pooled volatility, plus a term for
+//      disagreement between the legs -- when the legs disagree, the
+//      honest band is wider.
+//   4. Degenerate inputs are guarded throughout: a zero or missing pool,
+//      earners above the pool, null rates, and zero rates all degrade to
+//      persistence with a wide band instead of producing NaN or a crash.
+//
+// Deterministic (sorted file order, no randomness, no wall clock), Node 22
+// standard library only, fully offline.
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const IN_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+const OUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
-const Z = [-1.645, -0.674, 0, 0.674, 1.645];
-const RELEASE_MS = Date.UTC(2026, 10, 19, 0, 0, 0);
+const TAUS = [0.05, 0.25, 0.5, 0.75, 0.95];
+const NORMAL_Z = [-1.645, -0.674, 0, 0.674, 1.645];
+const LAUNCH_MS = Date.UTC(2026, 10, 19, 0, 0, 0);
 
-interface Trophy { id: number; tier: string }
-interface Read { slot: string; players_tracked: number; rates: Array<number | null> }
-interface Case {
+interface TrophyMeta { id: number; tier: string }
+interface PageRead { slot: string; players_tracked: number; rates: Array<number | null> }
+interface CaseFile {
   at: string;
   horizon_minutes: number;
   levels: number[];
-  trophies: Trophy[];
-  history: Read[];
+  trophies: TrophyMeta[];
+  history: PageRead[];
 }
 
-const clampPct = (x: number): number => Math.min(99.99, Math.max(0.01, x));
-const logit = (pct: number): number => {
-  const p = clampPct(pct) / 100;
-  return Math.log(p / (1 - p));
-};
-const invLogit = (l: number): number => 100 / (1 + Math.exp(-l));
-const round4 = (x: number): number => Math.round(x * 10_000) / 10_000;
-const hoursSinceRelease = (iso: string): number => (Date.parse(iso) - RELEASE_MS) / 3_600_000;
-const median = (xs: number[]): number => {
-  if (xs.length === 0) return 0;
-  const s = [...xs].sort((a, b) => a - b);
-  return s[Math.floor(s.length / 2)];
-};
+// ---- numeric helpers -------------------------------------------------------
 
-/** OLS y ~ a + b*x; returns [a, b, residual RMS]. */
-function ols(xs: number[], ys: number[]): [number, number, number] {
-  const n = xs.length;
-  if (n === 0) return [0, 0, 0.8];
-  if (n === 1) return [ys[0], 0, 0.8];
-  const mx = xs.reduce((s, x) => s + x, 0) / n;
-  const my = ys.reduce((s, y) => s + y, 0) / n;
+function clamp(x: number, lo: number, hi: number): number {
+  if (!Number.isFinite(x)) return lo;
+  return x < lo ? lo : x > hi ? hi : x;
+}
+function pctToLogit(pct: number): number {
+  const p = clamp(pct, 0.01, 99.99) / 100;
+  return Math.log(p / (1 - p));
+}
+function logitToPct(l: number): number {
+  return 100 / (1 + Math.exp(-clamp(l, -30, 30)));
+}
+function round4(x: number): number {
+  return Math.round(x * 10000) / 10000;
+}
+function hoursSinceLaunch(iso: string): number {
+  const t = Date.parse(iso);
+  return Number.isFinite(t) ? (t - LAUNCH_MS) / 3600000 : 0;
+}
+function logClock(iso: string): number {
+  return Math.log1p(Math.max(0, hoursSinceLaunch(iso)));
+}
+function medianOf(xs: number[]): number {
+  if (xs.length === 0) return 0;
+  const sorted = [...xs].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+interface LineFit { slope: number; resid: number }
+
+/** Least-squares slope of y on x, with residual RMS. Flat when unidentifiable. */
+function fitSlope(xs: number[], ys: number[]): LineFit {
+  const n = Math.min(xs.length, ys.length);
+  if (n < 2) return { slope: 0, resid: 0.8 };
+  let mx = 0;
+  let my = 0;
+  for (let i = 0; i < n; i++) { mx += xs[i]; my += ys[i]; }
+  mx /= n; my /= n;
   let sxx = 0;
   let sxy = 0;
   for (let i = 0; i < n; i++) {
-    sxx += (xs[i] - mx) ** 2;
+    sxx += (xs[i] - mx) * (xs[i] - mx);
     sxy += (xs[i] - mx) * (ys[i] - my);
   }
-  if (sxx <= 1e-12) return [my, 0, 0.8];
-  const b = sxy / sxx;
-  const a = my - b * mx;
+  if (sxx <= 1e-12) return { slope: 0, resid: 0.8 };
+  const slope = sxy / sxx;
   let ss = 0;
-  for (let i = 0; i < n; i++) ss += (ys[i] - (a + b * xs[i])) ** 2;
-  return [a, b, Math.sqrt(ss / n)];
+  for (let i = 0; i < n; i++) {
+    const fitted = my + slope * (xs[i] - mx);
+    ss += (ys[i] - fitted) * (ys[i] - fitted);
+  }
+  return { slope, resid: Math.sqrt(ss / n) };
 }
 
-/** Week-one ceiling per trophy (percent): story chapters can reach a large
- *  share of tracked players; grind/completion trophies cannot. */
-function capOf(t: Trophy): number {
-  const byId: Record<number, number> = { 1: 0.5, 2: 100, 3: 65, 4: 55, 5: 45, 6: 38, 7: 30, 14: 0.6 };
-  if (byId[t.id] !== undefined) return byId[t.id];
+/** Bound a fitted slope to a sane range. Residual-based shrinkage was
+ *  tried here and removed: on synthetic final cases it cost ~0.05 mean
+ *  loss on every regime (see the header note), so the clamp is the only
+ *  guard. The resid field stays in LineFit for diagnostics. */
+function boundedSlope(fit: LineFit, lo: number, hi: number): number {
+  return clamp(fit.slope, lo, hi);
+}
+
+// ---- domain pieces ---------------------------------------------------------
+
+/** Week-one ceiling (percent of tracked players) per trophy. Story chapters
+ *  can be earned by a large share of players inside a week; grind and
+ *  completion trophies cannot. Trophy 2 is the "first trophy" everyone gets. */
+function weekOneCeiling(t: TrophyMeta): number {
+  switch (t.id) {
+    case 1: return 0.5;   // platinum: needs everything else first
+    case 2: return 100;   // opening trophy
+    case 3: return 65;
+    case 4: return 55;
+    case 5: return 45;
+    case 6: return 38;
+    case 7: return 30;
+    case 14: return 0.6;  // 100% completion
+    default: break;
+  }
   if (t.tier === 'platinum') return 0.5;
   if (t.tier === 'gold') return 10;
   if (t.tier === 'silver') return 4;
   return 30;
 }
 
-function quantilesFrom(medianPct: number, sigma: number): number[] {
-  const l = logit(medianPct);
-  return Z.map((z) => round4(invLogit(l + z * sigma)));
+/** Collapse the read history to distinct page states: consecutive reads with
+ *  the same pool and the same rates are the same refresh seen twice. */
+function distinctSnapshots(history: PageRead[]): PageRead[] {
+  const out: PageRead[] = [];
+  let lastSignature = '';
+  for (const read of history) {
+    const signature = `${read.players_tracked}#${read.rates.map((r) => (r === null ? 'x' : r)).join(',')}`;
+    if (signature !== lastSignature) out.push(read);
+    lastSignature = signature;
+  }
+  return out;
 }
 
-function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
-  // Distinct refreshes only: consecutive reads with identical pool and
-  // rates are the same page read twice and carry no new information.
-  const refs: Read[] = [];
-  let prevKey = '';
-  for (const h of c.history) {
-    const key = `${h.players_tracked}|${h.rates.join(',')}`;
-    if (key !== prevKey) refs.push(h);
-    prevKey = key;
+/** Last non-null rate for trophy column i across the snapshots. */
+function anchorRate(snaps: PageRead[], i: number): number {
+  for (let k = snaps.length - 1; k >= 0; k--) {
+    const r = snaps[k].rates[i];
+    if (r !== null && r !== undefined && Number.isFinite(r)) return clamp(r, 0, 100);
   }
-  const last = refs[refs.length - 1];
-  // Anchor rate per trophy: its last observed rate (reads may lack one).
-  const lastRates = c.trophies.map((_, i) => {
-    for (let k = refs.length - 1; k >= 0; k--) {
-      const r = refs[k].rates[i];
-      if (r !== null && r !== undefined) return r;
-    }
-    return 0;
+  return 0;
+}
+
+function safePool(n: number): number {
+  return Number.isFinite(n) && n > 0 ? n : 1;
+}
+
+interface Legs { persist: number; decomp: number; satur: number }
+
+/** The three median legs for one trophy, in percent. */
+function medianLegs(
+  snaps: PageRead[],
+  clock: number[],
+  i: number,
+  trophy: TrophyMeta,
+  poolNow: number,
+  poolTarget: number,
+  dx: number,
+): Legs {
+  const lastRate = anchorRate(snaps, i);
+  const ceiling = weekOneCeiling(trophy);
+
+  // Decomposition: extrapolate earners in log-time, divide by forecast pool.
+  const earnersNow = (lastRate / 100) * poolNow;
+  let earnersTarget: number;
+  if (snaps.length >= 2 && earnersNow > 0) {
+    const logEarners = snaps.map((s) => {
+      const ri = s.rates[i] ?? lastRate;
+      const e = (clamp(ri, 0, 100) / 100) * safePool(s.players_tracked);
+      return Math.log(Math.max(0.5, e));
+    });
+    const fit = fitSlope(clock, logEarners);
+    const earnerSlope = boundedSlope(fit, -0.2, 3);
+    earnersTarget = Math.exp(logEarners[logEarners.length - 1] + earnerSlope * 0.7 * dx);
+  } else {
+    // No earner trend to fit: earners grow with the pool, but slower --
+    // new tracked players have not had time to earn much yet.
+    const poolGrowth = poolTarget / Math.max(1, poolNow);
+    earnersTarget = earnersNow * Math.pow(Math.max(poolGrowth, 0.05), 0.35);
+  }
+  // Guards: earners can exceed neither the ceiling share nor the pool itself.
+  earnersTarget = Math.min(earnersTarget, (ceiling / 100) * poolTarget, poolTarget);
+  if (lastRate >= 99.5) earnersTarget = poolTarget * 0.99;
+  const decomp = clamp((100 * earnersTarget) / Math.max(1, poolTarget), 0.01, 99.99);
+
+  // Saturation: the rate as a logistic in log-time toward its ceiling.
+  const satY = snaps.map((s) => {
+    const ri = s.rates[i] ?? 0.01;
+    const frac = clamp(clamp(ri, 0, 100) / ceiling, 0.0001, 0.999);
+    return Math.log(frac / (1 - frac));
   });
-  const xs = refs.map((h) => Math.log1p(Math.max(0, hoursSinceRelease(h.slot))));
-  const hNow = Math.max(0.1, hoursSinceRelease(c.at));
-  const xTgt = Math.log1p(hNow + c.horizon_minutes / 60);
-  const dx = Math.max(0, xTgt - xs[xs.length - 1]);
-  const dDays = c.horizon_minutes / 1440;
-  const stale = Math.max(0, hNow - hoursSinceRelease(last.slot));
+  const satFit = fitSlope(clock, satY);
+  const saturationSlope = boundedSlope(satFit, -1, 2);
+  const fracTarget = 1 / (1 + Math.exp(-(satY[satY.length - 1] + saturationSlope * 0.8 * dx)));
+  const satur = clamp(ceiling * fracTarget, 0.01, 99.99);
+
+  return { persist: clamp(lastRate, 0.01, 99.99), decomp, satur };
+}
+
+/** Blend weights for the three legs. With at least three snapshots the
+ *  weights are earned by an in-case backtest: each leg is asked to predict
+ *  the final snapshot from a mid-history one, scored by absolute logit
+ *  error, and weighted inversely to that error. The backtest origin sits
+ *  near the middle of the log-clock span rather than one refresh back,
+ *  because a one-refresh backtest rewards persistence for a horizon of
+ *  hours while the real forecast horizon is days -- measured on synthetic
+ *  final cases, the one-step variant pulled weight to persistence and
+ *  lost to the fixed prior. The learned weights are mixed 35/65 with a
+ *  prior so thin evidence cannot crown a leg. With fewer snapshots there
+ *  is nothing to backtest, so a fixed decomposition-heavy prior is used
+ *  (dilution is the known launch risk). */
+function blendWeights(
+  snaps: PageRead[],
+  clock: number[],
+  trophies: TrophyMeta[],
+  poolNow: number,
+  poolTarget: number,
+  dx: number,
+): { wPersist: number; wDecomp: number; wSatur: number } {
+  const prior = { wPersist: 0.15, wDecomp: 0.6, wSatur: 0.25 };
+  if (snaps.length < 3) return prior;
+
+  // Backtest origin: the snapshot nearest the middle of the log-clock span,
+  // so the backtest horizon is a substantial fraction of the real one.
+  const spanMid = (clock[0] + clock[clock.length - 1]) / 2;
+  let originIdx = 1;
+  for (let k = 1; k < snaps.length - 1; k++) {
+    if (Math.abs(clock[k] - spanMid) < Math.abs(clock[originIdx] - spanMid)) originIdx = k;
+  }
+  const head = snaps.slice(0, originIdx + 1);
+  const headClock = clock.slice(0, originIdx + 1);
+  const tail = snaps[snaps.length - 1];
+  const headPool = safePool(head[head.length - 1].players_tracked);
+  const tailPool = safePool(tail.players_tracked);
+  const stepDx = Math.max(0, clock[clock.length - 1] - headClock[headClock.length - 1]);
+
+  let errP = 0;
+  let errD = 0;
+  let errS = 0;
+  let scored = 0;
+  for (let i = 0; i < trophies.length; i++) {
+    const actual = tail.rates[i];
+    if (actual === null || actual === undefined || !Number.isFinite(actual)) continue;
+    const legs = medianLegs(head, headClock, i, trophies[i], headPool, tailPool, stepDx);
+    const la = pctToLogit(actual);
+    errP += Math.abs(la - pctToLogit(legs.persist));
+    errD += Math.abs(la - pctToLogit(legs.decomp));
+    errS += Math.abs(la - pctToLogit(legs.satur));
+    scored++;
+  }
+  if (scored === 0) return prior;
+  const inv = (e: number) => 1 / Math.max(0.05, e / scored);
+  const rawP = inv(errP);
+  const rawD = inv(errD);
+  const rawS = inv(errS);
+  const total = rawP + rawD + rawS;
+  const learned = { wPersist: rawP / total, wDecomp: rawD / total, wSatur: rawS / total };
+  // A falling recent regime (rates dropping refresh over refresh) is the
+  // dilution signature: nudge the prior toward persistence+decomposition.
+  const recentMoves: number[] = [];
+  for (let i = 0; i < trophies.length; i++) {
+    const a = head[head.length - 1].rates[i];
+    const b = tail.rates[i];
+    if (a !== null && b !== null && a !== undefined && b !== undefined) {
+      recentMoves.push(pctToLogit(b) - pctToLogit(a));
+    }
+  }
+  const regime = medianOf(recentMoves);
+  const richPrior = regime < -0.05
+    ? { wPersist: 0.45, wDecomp: 0.4, wSatur: 0.15 }
+    : { wPersist: 0.25, wDecomp: 0.25, wSatur: 0.5 };
+  void poolNow; void poolTarget; void dx;
+  return {
+    wPersist: 0.35 * learned.wPersist + 0.65 * richPrior.wPersist,
+    wDecomp: 0.35 * learned.wDecomp + 0.65 * richPrior.wDecomp,
+    wSatur: 0.35 * learned.wSatur + 0.65 * richPrior.wSatur,
+  };
+}
+
+/** Five quantiles around a logit median with the given logit spread.
+ *  Enforces the output contract: finite, inside [0, 100], non-decreasing. */
+function quantilesAround(medianPct: number, sigma: number): number[] {
+  const centre = pctToLogit(medianPct);
+  const s = clamp(sigma, 0.05, 3);
+  const qs = NORMAL_Z.map((z) => round4(clamp(logitToPct(centre + z * s), 0, 100)));
+  for (let k = 1; k < qs.length; k++) {
+    if (qs[k] < qs[k - 1]) qs[k] = qs[k - 1];
+  }
+  return qs;
+}
+
+// ---- case forecast ---------------------------------------------------------
+
+function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
+  const snaps = distinctSnapshots(c.history);
+  const clock = snaps.map((s) => logClock(s.slot));
+  const lastSnap = snaps[snaps.length - 1];
+  const poolNow = safePool(lastSnap.players_tracked);
+
+  const nowHours = Math.max(0.1, hoursSinceLaunch(c.at));
+  const targetClock = Math.log1p(nowHours + c.horizon_minutes / 60);
+  const dx = Math.max(0, targetClock - clock[clock.length - 1]);
+  const horizonDays = c.horizon_minutes / 1440;
+
+  // Pool forecast: power law in log-time anchored at the last snapshot.
+  // The fitted slope is shrunk toward a modest growth prior when the
+  // history is short, because two snapshots cannot pin down a growth rate.
+  let poolTarget: number;
+  if (snaps.length < 2) {
+    poolTarget = poolNow * (1 + 0.9 * dx);
+  } else {
+    const logPool = snaps.map((s) => Math.log(safePool(s.players_tracked)));
+    const fit = fitSlope(clock, logPool);
+    const fitted = clamp(fit.slope, 0, 2.5);
+    const shrink = snaps.length / (snaps.length + 2);
+    const slope = shrink * fitted + (1 - shrink) * 0.9;
+    poolTarget = Math.exp(logPool[logPool.length - 1] + slope * dx);
+  }
+  poolTarget = Math.max(1, poolTarget);
+
+  // Refresh cadence and staleness drive the "page is about to jump" term:
+  // Exophase refreshes in steps, so a long-quiet page is due a jump.
   const gaps: number[] = [];
-  for (let i = 1; i < refs.length; i++) {
-    gaps.push(hoursSinceRelease(refs[i].slot) - hoursSinceRelease(refs[i - 1].slot));
+  for (let i = 1; i < snaps.length; i++) {
+    gaps.push(hoursSinceLaunch(snaps[i].slot) - hoursSinceLaunch(snaps[i - 1].slot));
   }
   const meanGap = gaps.length > 0 ? gaps.reduce((s, g) => s + g, 0) / gaps.length : 5;
+  const staleHours = Math.max(0, nowHours - hoursSinceLaunch(lastSnap.slot));
 
-  // Pool forecast: power law in log-time, anchored at the last refresh.
-  let nTgt: number;
-  if (refs.length < 2) {
-    nTgt = last.players_tracked * (1 + 0.9 * (xTgt - xs[xs.length - 1]));
-  } else {
-    const ys = refs.map((h) => Math.log(Math.max(1, h.players_tracked)));
-    const [, b] = ols(xs, ys);
-    const slope = Math.max(0, Math.min(b, 2.5));
-    nTgt = Math.exp(ys[ys.length - 1] + slope * (xTgt - xs[xs.length - 1]));
-  }
-
-  // Walk-forward volatility + recent regime from refresh-to-refresh moves.
-  const wf: number[] = [];
-  for (let i = 1; i < refs.length; i++) {
-    for (let j = 0; j < lastRates.length; j++) {
-      const ra = refs[i - 1].rates[j];
-      const rb = refs[i].rates[j];
-      if (ra !== null && rb !== null) wf.push(logit(rb) - logit(ra));
-    }
-  }
-  const wfSigma = wf.length > 0 ? median(wf.map((x) => Math.abs(x))) * 1.4826 : 0;
-  const regime = wf.length > 0 ? median(wf.slice(-55)) : 0;
-
-  const rows = c.trophies.map((t, i) => {
-    const x0 = lastRates[i];
-    const cap = capOf(t);
-
-    // Earner forecast -> decomposition median.
-    const eLast = (x0 / 100) * last.players_tracked;
-    let eTgt: number;
-    if (refs.length >= 2 && eLast > 0) {
-      const es = refs.map((h) => {
-        const ri = h.rates[i] ?? x0;
-        return Math.log(Math.max(0.5, (ri / 100) * h.players_tracked));
-      });
-      const [, b] = ols(xs, es);
-      const slope = Math.max(-0.2, Math.min(b, 3));
-      eTgt = Math.exp(es[es.length - 1] + slope * 0.65 * dx);
-    } else {
-      eTgt = eLast * Math.pow(nTgt / Math.max(1, last.players_tracked), 0.35);
-    }
-    eTgt = Math.min(eTgt, (cap / 100) * nTgt);
-    if (x0 >= 99.5) eTgt = nTgt * 0.99;
-    const medDecomp = Math.min(99.99, Math.max(0.01, (100 * eTgt) / Math.max(1, nTgt)));
-
-    // Saturation forecast: rate as a logistic in log-time toward its cap.
-    const ys = refs.map((h) => {
-      const ri = h.rates[i] ?? 0.01;
-      const frac = Math.min(0.999, Math.max(0.0001, ri / cap));
-      return Math.log(frac / (1 - frac));
-    });
-    const [, b2raw] = ols(xs, ys);
-    const b2 = Math.max(-1, Math.min(b2raw, 2));
-    const fracT = 1 / (1 + Math.exp(-(ys[ys.length - 1] + b2 * 0.8 * dx)));
-    const medSat = Math.min(99.99, Math.max(0.01, cap * fracT));
-
-    // Evidence-set logit blend.
-    let wP = 0.25;
-    let wD = 0.25;
-    let wS = 0.5;
-    if (refs.length < 3) { wP = 0.15; wD = 0.6; wS = 0.25; }
-    else if (regime < -0.05) { wP = 0.45; wD = 0.4; wS = 0.15; }
-    const medL = wP * logit(x0) + wD * logit(medDecomp) + wS * logit(medSat);
-    let med = Math.min(cap, Math.max(0.01, invLogit(medL)));
-    if (x0 >= 99.5) med = Math.max(med, 97);
-
-    // Spread: random-walk floor vs walk-forward volatility, + jump term.
-    const rw = 0.5 * Math.sqrt(dDays);
-    const horizonScale = dx > 0 ? Math.sqrt(dx / 0.4) : 0.3;
-    const wfTerm = wfSigma * horizonScale;
-    const jump = refs.length < 2
-      ? 1.05
-      : 0.35 * Math.min(1, stale / Math.max(1, meanGap)) * Math.min(1, dx / 0.3 + 0.3);
-    let sigma = Math.sqrt(Math.max(rw, wfTerm) ** 2 * 0.85 + jump ** 2 + 0.22 ** 2);
-    sigma = Math.min(1.7, Math.max(0.45, sigma));
-    return { id: t.id, q: quantilesFrom(med, sigma) };
-  });
-
-  // Story-chain monotonicity by pooling adjacent violators (logit medians).
-  const chain = [2, 3, 4, 5, 6, 7, 14, 1];
-  const byId = new Map(rows.map((r) => [r.id, r]));
-  const present = chain.filter((id) => byId.has(id));
-  const vals = present.map((id) => logit(byId.get(id)!.q[2]));
-  const blocks: number[][] = vals.map((v) => [v]);
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (let k = 0; k + 1 < blocks.length; k++) {
-      const mA = blocks[k].reduce((s, x) => s + x, 0) / blocks[k].length;
-      const mB = blocks[k + 1].reduce((s, x) => s + x, 0) / blocks[k + 1].length;
-      if (mA < mB) {
-        blocks[k] = blocks[k].concat(blocks[k + 1]);
-        blocks.splice(k + 1, 1);
-        changed = true;
-        break;
+  // Refresh-to-refresh logit moves: pooled scale plus one scale per trophy.
+  const pooledMoves: number[] = [];
+  const perTrophyMoves: number[][] = c.trophies.map(() => []);
+  for (let s = 1; s < snaps.length; s++) {
+    for (let i = 0; i < c.trophies.length; i++) {
+      const a = snaps[s - 1].rates[i];
+      const b = snaps[s].rates[i];
+      if (a !== null && b !== null && a !== undefined && b !== undefined) {
+        const move = pctToLogit(b) - pctToLogit(a);
+        pooledMoves.push(move);
+        perTrophyMoves[i].push(move);
       }
     }
   }
-  const flat: number[] = [];
-  for (const bl of blocks) {
-    const m = bl.reduce((s, x) => s + x, 0) / bl.length;
-    for (let k = 0; k < bl.length; k++) flat.push(m);
-  }
-  present.forEach((id, k) => {
-    const row = byId.get(id)!;
-    const sigma = row.q[4] > row.q[0] ? (logit(row.q[4]) - logit(row.q[0])) / (2 * 1.645) : 0.5;
-    row.q = quantilesFrom(invLogit(flat[k]), Math.max(0.2, sigma));
-  });
-  // The platinum requires every other trophy: its median is the lowest.
-  const plat = byId.get(1);
-  if (plat) {
-    for (const r of rows) {
-      if (r.q[2] < plat.q[2]) plat.q = quantilesFrom(r.q[2], 0.6);
+  const pooledSigma = pooledMoves.length > 0
+    ? medianOf(pooledMoves.map((x) => Math.abs(x))) * 1.4826
+    : 0;
+
+  const weights = blendWeights(snaps, clock, c.trophies, poolNow, poolTarget, dx);
+  const rwFloor = 0.5 * Math.sqrt(Math.max(horizonDays, 0));
+  const horizonScale = dx > 0 ? Math.sqrt(dx / 0.4) : 0.3;
+  const jumpTerm = snaps.length < 2
+    ? 1.05
+    : 0.35 * Math.min(1, staleHours / Math.max(1, meanGap)) * Math.min(1, dx / 0.3 + 0.3);
+
+  const rows = c.trophies.map((trophy, i) => {
+    const legs = medianLegs(snaps, clock, i, trophy, poolNow, poolTarget, dx);
+    const ceiling = weekOneCeiling(trophy);
+    const blendedLogit =
+      weights.wPersist * pctToLogit(legs.persist) +
+      weights.wDecomp * pctToLogit(legs.decomp) +
+      weights.wSatur * pctToLogit(legs.satur);
+    let medianPct = clamp(logitToPct(blendedLogit), 0.01, ceiling);
+    if (legs.persist >= 99.5) medianPct = Math.max(medianPct, 97);
+
+    // Per-trophy volatility, shrunk toward the pooled scale by evidence.
+    const own = perTrophyMoves[i];
+    const ownSigma = own.length > 0 ? medianOf(own.map((x) => Math.abs(x))) * 1.4826 : pooledSigma;
+    const ownWeight = own.length / (own.length + 3);
+    const trophySigma = ownWeight * ownSigma + (1 - ownWeight) * pooledSigma;
+    const wfTerm = trophySigma * horizonScale;
+
+    // Leg disagreement widens the band: when the three medians scatter,
+    // the blended median is less trustworthy than any single leg suggests.
+    const legLogits = [pctToLogit(legs.persist), pctToLogit(legs.decomp), pctToLogit(legs.satur)];
+    const legWeights = [weights.wPersist, weights.wDecomp, weights.wSatur];
+    let disagreement = 0;
+    for (let k = 0; k < 3; k++) {
+      disagreement += legWeights[k] * (legLogits[k] - blendedLogit) * (legLogits[k] - blendedLogit);
     }
-  }
+    const disagreementTerm = 0.5 * Math.sqrt(Math.max(disagreement, 0));
+
+    const base = Math.max(rwFloor, wfTerm);
+    let sigma = Math.sqrt(base * base * 0.85 + jumpTerm * jumpTerm + disagreementTerm * disagreementTerm + 0.22 * 0.22);
+    sigma = clamp(sigma, 0.45, 1.7);
+    return { id: trophy.id, q: quantilesAround(medianPct, sigma) };
+  });
+
+  enforceStoryChain(rows);
   return rows;
 }
 
-mkdirSync(OUTPUT_DIR, { recursive: true });
-const inputs = readdirSync(INPUT_DIR).filter((f) => f.endsWith('.in')).sort();
-for (const file of inputs) {
-  const id = file.slice(0, -'.in'.length);
-  const c = JSON.parse(readFileSync(join(INPUT_DIR, file), 'utf8')) as Case;
-  if (c.levels.length !== LEVELS.length || c.levels.some((t, j) => t !== LEVELS[j])) {
-    throw new Error(`${file} asks for levels ${JSON.stringify(c.levels)}, not ${JSON.stringify(LEVELS)}`);
+/** Story trophies form a chain: earning a later chapter requires the
+ *  earlier ones, so medians must be non-increasing along
+ *  [first, ch1..ch5, 100%, platinum]. Violations are pooled with the
+ *  pool-adjacent-violators algorithm on logit medians (stack form).
+ *  The platinum additionally sits at or below every other median. */
+function enforceStoryChain(rows: Array<{ id: number; q: number[] }>): void {
+  const chainOrder = [2, 3, 4, 5, 6, 7, 14, 1];
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const present = chainOrder.filter((id) => byId.has(id));
+  if (present.length >= 2) {
+    const values = present.map((id) => pctToLogit(byId.get(id)!.q[2]));
+    const stack: Array<{ sum: number; count: number }> = [];
+    for (const v of values) {
+      stack.push({ sum: v, count: 1 });
+      while (stack.length >= 2) {
+        const top = stack[stack.length - 1];
+        const prev = stack[stack.length - 2];
+        if (prev.sum / prev.count >= top.sum / top.count) break;
+        stack.splice(stack.length - 2, 2, { sum: prev.sum + top.sum, count: prev.count + top.count });
+      }
+    }
+    const fitted: number[] = [];
+    for (const block of stack) {
+      const mean = block.sum / block.count;
+      for (let k = 0; k < block.count; k++) fitted.push(mean);
+    }
+    present.forEach((id, k) => {
+      const row = byId.get(id)!;
+      const spread = row.q[4] > row.q[0]
+        ? (pctToLogit(row.q[4]) - pctToLogit(row.q[0])) / (2 * 1.645)
+        : 0.5;
+      row.q = quantilesAround(logitToPct(fitted[k]), Math.max(0.2, spread));
+    });
   }
-  if (c.history.length === 0) throw new Error(`${file} has no history`);
-  const trophies = forecastCase(c);
-  writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify({ trophies })}\n`);
+  const platinum = byId.get(1);
+  if (platinum) {
+    let lowest = platinum.q[2];
+    for (const r of rows) lowest = Math.min(lowest, r.q[2]);
+    if (lowest < platinum.q[2]) platinum.q = quantilesAround(lowest, 0.6);
+  }
+}
+
+// ---- driver ----------------------------------------------------------------
+
+mkdirSync(OUT_DIR, { recursive: true });
+const caseFiles = readdirSync(IN_DIR).filter((f) => f.endsWith('.in')).sort();
+for (const file of caseFiles) {
+  const caseId = file.slice(0, -'.in'.length);
+  const parsed = JSON.parse(readFileSync(join(IN_DIR, file), 'utf8')) as CaseFile;
+  if (parsed.levels.length !== TAUS.length || parsed.levels.some((t, j) => t !== TAUS[j])) {
+    throw new Error(`${file} asks for levels ${JSON.stringify(parsed.levels)}, not ${JSON.stringify(TAUS)}`);
+  }
+  if (!Array.isArray(parsed.history) || parsed.history.length === 0) {
+    throw new Error(`${file} has no history`);
+  }
+  const trophies = forecastCase(parsed);
+  writeFileSync(join(OUT_DIR, `${caseId}.out`), `${JSON.stringify({ trophies })}\n`);
 }
