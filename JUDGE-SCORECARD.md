@@ -216,3 +216,79 @@ regime; expected final loss from the simulations is now roughly
 0.23–0.38 depending on regime, still an estimate, never a promise. The
 practice loss of 0.718 is unchanged and is still not the expected final
 loss.
+
+## Round 3 (undamped recent-half slopes + pool damping + slope shrinkage)
+
+Round 3 evaluated eight single-change variants against round 2, paired on
+identical simulated worlds (30 worlds per regime), across three simulators
+with different mechanics, plus one real-data case. The simulators were
+calibrated to the two observed real states (launch-night 638-player page;
+live page fetched 2026-11-20 20:27 UTC: ch1 11.98%, ch2 1.71%, ch3
+0.03%, median trophy 0.02%):
+
+- **A**: power-law pool in log-time, lognormal earner CDFs in log-time
+  toward day-7 shares, refresh every 3–7 h (same family as round 2's
+  simulator, independently implemented).
+- **B**: logistic pool saturation, Weibull earner CDFs in hours, refresh
+  every 6–12 h.
+- **C**: cohort convolution — players join over time and earn after a
+  lognormal delay since joining, so dilution and concave log-earner
+  curves arise mechanically.
+- **Real case**: history = the launch-night flat page (practice p00),
+  target = the live page 41 h later. Round 2 scores 2.0912 there vs the
+  house persistence baseline's 2.8324. Every rich-history variant ties
+  round 2 on it by construction (single distinct snapshot).
+
+Mean pinball loss (round 2 → round-3 pick), seed 1000:
+
+| suite | R2 | R3 | paired Δ |
+|---|---|---|---|
+| A-base | 0.3232 | 0.3116 | −0.0116 |
+| A-dilution | 0.2727 | 0.2605 | −0.0122 |
+| A-catchup | 0.3778 | 0.3650 | −0.0127 |
+| B-base | 0.4570 | 0.3655 | −0.0915 |
+| B-dilution | 0.4261 | 0.3529 | −0.0732 |
+| B-catchup | 0.4576 | 0.3642 | −0.0934 |
+| C-base | 0.4163 | 0.3376 | −0.0787 |
+| C-dilution | 0.4515 | 0.3581 | −0.0934 |
+| C-catchup | 0.3755 | 0.3258 | −0.0497 |
+| real | 2.0912 | 2.0912 | 0.0000 |
+
+Fresh seed (5000) on A+B: same direction on every regime (paired Δ
+−0.008 to −0.099). Per-case win rate vs round 2: 245/270 = 91%.
+Practice outputs byte-identical to round 2 (verified by direct run), so
+practice loss stays 0.7180/0.7112. Deterministic; degenerate inputs
+(pool 0, null rates) produce finite monotone output.
+
+What won, in order of contribution:
+1. **Undamped slopes** (earner 0.7→1.0, saturation 0.8→1.0): mean paired
+   −0.035 alone, better on all 9 sim suites. The damping factors were
+   tuned for whole-history slopes; a recent-half slope already measures
+   current velocity, so damping double-counts the bend.
+2. **Pool damping** (slope·dx → slope·dx/(1+0.3·dx)): −0.010 alone,
+   better everywhere; a pure power law over-forecasts the day-7 pool.
+3. **Cross-trophy earner-slope shrinkage** (weight own/(own+25) toward
+   the case median slope): ~tie on A, −0.004…−0.008 on B/C alone, and
+   additive on top of 1+2 (−0.049 combined vs −0.039 without it).
+
+Rejected this round, each measured paired vs round 2:
+- `trophies_earned` aggregate-slope blending (+0.020 — the aggregate is
+  dominated by the opening trophy and the easy ones).
+- Recency-weighted (exponential) slope fits (+0.078 — the hard recent
+  half beats soft weighting).
+- Asymmetric spread by ceiling headroom (≈0.000, mixed signs; also
+  would have moved the practice outputs).
+- Per-quantile story-chain pooling (no-op — medians already pooled and
+  spreads are similar along the chain).
+- Recent-half blend in the pool fit (+0.009 — consistent with round 2's
+  rejection of recent-half pool fits).
+
+Honest reading: round 3's gains are simulation-measured, not
+ground-truth-measured; the one real-data case cannot discriminate
+rich-history changes. The mechanism story (recent-half slope = current
+velocity, so no second damping) is coherent with round 2's own finding,
+and the win is consistent across three generative processes, two seeds,
+and 91% of individual worlds. Expected final loss from these
+simulations: roughly 0.26–0.37 depending on regime — an estimate, never
+a promise. The practice loss of 0.718 is unchanged and is still not the
+expected final loss.

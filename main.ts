@@ -48,6 +48,39 @@
 // catch-up regimes) and also won on a perturbed simulator with a different
 // generative process. Full measurements in JUDGE-SCORECARD.md.
 //
+// Round-3 improvement (this build, over round 2): three changes, each
+// measured paired against round 2 on identical simulated worlds across
+// three simulators with different mechanics (power-law pool + lognormal
+// earners; logistic pool + Weibull earners; cohort-convolution earners),
+// 30 worlds per regime, two seeds; practice outputs are byte-identical to
+// round 2 (every change needs at least two distinct snapshots to bite):
+//   1. The earner and saturation slopes are no longer damped (the old
+//      0.7 / 0.8 factors). Those factors were tuned when slopes were fitted
+//      on the whole history, whose average overstates current velocity;
+//      a recent-half slope already measures current velocity, so damping
+//      it again double-counts the bend. Removing both factors was the
+//      single largest gain (mean paired loss -0.035 across regimes).
+//   2. The pool forecast's log-time slope is damped over the horizon
+//      (slope * dx / (1 + 0.3 * dx)): tracked-pool growth decelerates as
+//      the launch surge passes, and a pure power law over-forecasts the
+//      day-7 pool, which under-forecasts every rate.
+//   3. Each trophy's earner slope is shrunk toward the case-wide median
+//      earner slope, weighted by its earner count (own / (own + 25)): a
+//      rare trophy's slope is fitted on a handful of earners and is mostly
+//      quantization noise, while the median slope is the launch's shared
+//      progression velocity.
+// Together: mean paired loss -0.049 vs round 2 on the first seed, -0.05 to
+// -0.10 per regime on the cohort simulator, 91% per-case win rate, and a
+// tie on the one real-data case available (launch-night page forecast to
+// the live page 41 h later, where round 2 already beat the house
+// persistence baseline 2.09 vs 2.83). Rejected this round, each measured:
+// trophies_earned aggregate-slope blending (lost everywhere -- the
+// aggregate is dominated by the opening trophy and the easy ones),
+// recency-weighted slope fits (lost badly to the hard recent half),
+// asymmetric spread by ceiling headroom (no gain, and it would move the
+// practice outputs), per-quantile story-chain pooling (no-op), and a
+// recent-half blend in the pool fit (lost on the perturbed simulator).
+//
 // Deterministic (sorted file order, no randomness, no wall clock), Node 22
 // standard library only, fully offline.
 
@@ -204,7 +237,9 @@ function safePool(n: number): number {
 
 interface Legs { persist: number; decomp: number; satur: number }
 
-/** The three median legs for one trophy, in percent. */
+/** The three median legs for one trophy, in percent. `medEarnerSlope` is
+ *  the case-wide median recent-half earner slope (see medianEarnerSlope),
+ *  used to shrink noisy per-trophy slopes; null disables the shrinkage. */
 function medianLegs(
   snaps: PageRead[],
   clock: number[],
@@ -213,6 +248,7 @@ function medianLegs(
   poolNow: number,
   poolTarget: number,
   dx: number,
+  medEarnerSlope: number | null,
 ): Legs {
   const lastRate = anchorRate(snaps, i);
   const ceiling = weekOneCeiling(trophy);
@@ -228,8 +264,22 @@ function medianLegs(
     });
     const [earnerClock, earnerY] = recentHalf(clock, logEarners);
     const fit = fitSlope(earnerClock, earnerY);
-    const earnerSlope = boundedSlope(fit, -0.2, 3);
-    earnersTarget = Math.exp(logEarners[logEarners.length - 1] + earnerSlope * 0.7 * dx);
+    const ownSlope = boundedSlope(fit, -0.2, 3);
+    // Cross-trophy shrinkage: a rare trophy's slope is fitted on a handful
+    // of earners and is mostly quantization noise (rates print to 2
+    // decimals); shrink it toward the case-wide median earner slope with
+    // weight by earner count, so well-observed trophies keep their own
+    // velocity and thin ones borrow the launch's shared progression pace.
+    const wOwn = earnersNow / (earnersNow + 25);
+    const earnerSlope = medEarnerSlope === null
+      ? ownSlope
+      : wOwn * ownSlope + (1 - wOwn) * medEarnerSlope;
+    // No extra damping on the extrapolation: the recent-half slope already
+    // measures current velocity. The 0.7 factor this replaces was tuned
+    // for whole-history slopes, whose average overstates current velocity
+    // after the launch bend; damping a recent-half slope double-counts
+    // the bend and under-forecasts earner growth over a multi-day horizon.
+    earnersTarget = Math.exp(logEarners[logEarners.length - 1] + earnerSlope * dx);
   } else {
     // No earner trend to fit: earners grow with the pool, but slower --
     // new tracked players have not had time to earn much yet.
@@ -250,10 +300,34 @@ function medianLegs(
   const [satClock, satYRecent] = recentHalf(clock, satY);
   const satFit = fitSlope(satClock, satYRecent);
   const saturationSlope = boundedSlope(satFit, -1, 2);
-  const fracTarget = 1 / (1 + Math.exp(-(satY[satY.length - 1] + saturationSlope * 0.8 * dx)));
+  // Undamped, for the same reason as the earner leg: the recent-half
+  // slope is already the current velocity toward the ceiling.
+  const fracTarget = 1 / (1 + Math.exp(-(satY[satY.length - 1] + saturationSlope * dx)));
   const satur = clamp(ceiling * fracTarget, 0.01, 99.99);
 
   return { persist: clamp(lastRate, 0.01, 99.99), decomp, satur };
+}
+
+/** Case-wide median recent-half earner slope: the launch's shared
+ *  progression velocity, used as the shrinkage target for per-trophy
+ *  earner slopes. Null when the history is too thin to estimate it
+ *  (fewer than two snapshots, or fewer than five trophies with earners),
+ *  in which case each trophy keeps its own slope. */
+function medianEarnerSlope(snaps: PageRead[], clock: number[], trophies: TrophyMeta[]): number | null {
+  if (snaps.length < 2) return null;
+  const slopes: number[] = [];
+  for (let i = 0; i < trophies.length; i++) {
+    const lr = anchorRate(snaps, i);
+    if (lr <= 0) continue;
+    const logEarners = snaps.map((s) => {
+      const ri = s.rates[i] ?? lr;
+      const e = (clamp(ri, 0, 100) / 100) * safePool(s.players_tracked);
+      return Math.log(Math.max(0.5, e));
+    });
+    const [ec, ey] = recentHalf(clock, logEarners);
+    slopes.push(boundedSlope(fitSlope(ec, ey), -0.2, 3));
+  }
+  return slopes.length >= 5 ? medianOf(slopes) : null;
 }
 
 /** Blend weights for the three legs. With at least three snapshots the
@@ -275,6 +349,7 @@ function blendWeights(
   poolNow: number,
   poolTarget: number,
   dx: number,
+  medEarnerSlope: number | null,
 ): { wPersist: number; wDecomp: number; wSatur: number } {
   const prior = { wPersist: 0.15, wDecomp: 0.6, wSatur: 0.25 };
   if (snaps.length < 3) return prior;
@@ -300,7 +375,7 @@ function blendWeights(
   for (let i = 0; i < trophies.length; i++) {
     const actual = tail.rates[i];
     if (actual === null || actual === undefined || !Number.isFinite(actual)) continue;
-    const legs = medianLegs(head, headClock, i, trophies[i], headPool, tailPool, stepDx);
+    const legs = medianLegs(head, headClock, i, trophies[i], headPool, tailPool, stepDx, medEarnerSlope);
     const la = pctToLogit(actual);
     errP += Math.abs(la - pctToLogit(legs.persist));
     errD += Math.abs(la - pctToLogit(legs.decomp));
@@ -373,7 +448,12 @@ function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
     const fitted = clamp(fit.slope, 0, 2.5);
     const shrink = snaps.length / (snaps.length + 2);
     const slope = shrink * fitted + (1 - shrink) * 0.9;
-    poolTarget = Math.exp(logPool[logPool.length - 1] + slope * dx);
+    // Damped over the horizon: tracked-pool growth decelerates as the
+    // launch surge passes, so a pure power law over-forecasts the day-7
+    // pool and under-forecasts every rate. Dividing the log-time step by
+    // (1 + 0.3 * dx) bends the extrapolation toward saturation while
+    // leaving short horizons (dx near 0) almost untouched.
+    poolTarget = Math.exp(logPool[logPool.length - 1] + slope * dx / (1 + 0.3 * dx));
   }
   poolTarget = Math.max(1, poolTarget);
 
@@ -404,7 +484,8 @@ function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
     ? medianOf(pooledMoves.map((x) => Math.abs(x))) * 1.4826
     : 0;
 
-  const weights = blendWeights(snaps, clock, c.trophies, poolNow, poolTarget, dx);
+  const medSlope = medianEarnerSlope(snaps, clock, c.trophies);
+  const weights = blendWeights(snaps, clock, c.trophies, poolNow, poolTarget, dx, medSlope);
   const rwFloor = 0.5 * Math.sqrt(Math.max(horizonDays, 0));
   const horizonScale = dx > 0 ? Math.sqrt(dx / 0.4) : 0.3;
   const jumpTerm = snaps.length < 2
@@ -412,7 +493,7 @@ function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
     : 0.35 * Math.min(1, staleHours / Math.max(1, meanGap)) * Math.min(1, dx / 0.3 + 0.3);
 
   const rows = c.trophies.map((trophy, i) => {
-    const legs = medianLegs(snaps, clock, i, trophy, poolNow, poolTarget, dx);
+    const legs = medianLegs(snaps, clock, i, trophy, poolNow, poolTarget, dx, medSlope);
     const ceiling = weekOneCeiling(trophy);
     const blendedLogit =
       weights.wPersist * pctToLogit(legs.persist) +
