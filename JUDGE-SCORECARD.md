@@ -154,3 +154,65 @@ in the dilution-heavy stress regime for the same reason M11 did. Expected
 final loss from the simulations: roughly 0.28–0.45 depending on regime,
 unchanged as an estimate; the practice loss of 0.718 is not the expected
 final loss and is never presented as such.
+
+## Round-2 improvement (2026-11-20): recent-half slope fits
+
+One change over M12, nothing else: the earner leg and the saturation leg
+fit their log-time slopes on the most recent half of the distinct
+snapshots (at least 3 points; the whole history when shorter) instead of
+the whole history. The pool forecast keeps its whole-history fit, the
+blend weights, spread, caps, and story-chain logic are untouched.
+
+Why: both curves bend in log-time. Earner counts saturate as the easy
+earners finish; rates crest and then dilute as the tracked pool floods
+in. A whole-history slope averages the steep early phase with the
+flattening later phase, and extrapolating that average over the final's
+4.5-day horizon overshoots. The recent-half slope measures the current
+velocity. The practice cases hold a single distinct refresh, where the
+recent half is the whole history, so the practice loss is unchanged by
+construction — the change only bites on rich histories like the final's.
+
+Measured (same evaluations as above; paired per-world differences against
+M12 on identical simulated worlds):
+
+| candidate | practice p00 | practice p01 | sim base | sim dilution | sim catchup |
+|---|---|---|---|---|---|
+| M12 (round 1, submitted) | 0.7180 | 0.7112 | 0.4027 | 0.7622 | 0.2754 |
+| **Round 2 shipped** | **0.7180** | **0.7112** | **0.2573** | **0.3816** | **0.2284** |
+| M0 house persistence (control) | 1.5084 | 1.5084 | 0.3840 | 0.6733 | 0.2809 |
+
+Coverage (90% band) of round 2: practice 0.98, sim base 0.99, sim
+dilution 0.94, sim catchup 1.00 (M12: 0.98 / 0.94 / 0.72 / 1.00).
+
+Robustness checks, all paired against M12 on identical worlds:
+- Fresh simulator seed (40 worlds/regime): base −0.137, dilution −0.377,
+  catchup −0.043 — same margins, not seed-fitted.
+- Perturbed simulator with a different generative process (logistic pool
+  saturation instead of a power law, Weibull earner CDFs instead of
+  lognormal, 6–12 h refresh cadence): base −0.019, dilution −0.014,
+  catchup −0.016 — smaller margins, same direction on every regime. The
+  mechanism (local slope under curvature) is not tied to one curve family.
+- Ablations: recent-half on the earner leg alone −0.067/−0.133/−0.022;
+  on the saturation leg alone −0.109/−0.300/−0.033; on the pool fit alone
+  +0.012/+0.005/+0.006 (rejected — pool stays whole-history). Fraction
+  sensitivity is mild (recent third ≈ recent half; recent 2/3 slightly
+  worse), so the half is not a knife-edge constant.
+
+Rejected in this round, each measured against M12 on all five
+evaluations: earner-CDF leg (worse on base and dilution); backtest
+sigma calibration (helped dilution, hurt base and catchup); backtest
+median bias correction (helped dilution, hurt the other regimes — the
+mid-history bias does not transfer to the forecast period); a damped
+trend leg and multi-origin/per-trophy learned weights (gains of
+0.001–0.007, inside selection noise once the recent-half change is in);
+data-fitted ceilings (no gain on top of recent-half slopes).
+
+Honest reading: round 2 ties M12 on the only ground-truth evaluation
+and beats it — and the house persistence baseline — on every
+final-horizon simulation, including a simulator built on different
+mechanics. The simulations remain stress tests, not ground truth, and
+the real final (2.5 days of reads, day-7 target) will have its own
+regime; expected final loss from the simulations is now roughly
+0.23–0.38 depending on regime, still an estimate, never a promise. The
+practice loss of 0.718 is unchanged and is still not the expected final
+loss.
